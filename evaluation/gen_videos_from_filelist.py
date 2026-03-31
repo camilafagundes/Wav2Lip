@@ -1,10 +1,23 @@
 from os import listdir, path
 import numpy as np
 import scipy, cv2, os, sys, argparse
+from pathlib import Path
+
 import dlib, json, subprocess
 from tqdm import tqdm
 from glob import glob
 import torch
+
+# PyTorch >= 2.6: checkpoints Wav2Lip via safe_torch_load (weights_only=False).
+_p = Path(__file__).resolve().parent
+while _p != _p.parent:
+	if (_p / "utils" / "torch_compat.py").is_file():
+		sys.path.insert(0, str(_p))
+		break
+	_p = _p.parent
+else:
+	raise ImportError("Defina PYTHONPATH para a pasta avatar-ai (utils/torch_compat.py).")
+from utils.torch_compat import safe_torch_load
 
 sys.path.append('../')
 import audio
@@ -127,24 +140,25 @@ detector = face_detection.FaceAlignment(face_detection.LandmarksType._2D,
 											flip_input=False, device=device)
 
 def _load(checkpoint_path):
-	if device == 'cuda':
-		checkpoint = torch.load(checkpoint_path)
-	else:
-		checkpoint = torch.load(checkpoint_path,
-								map_location=lambda storage, loc: storage)
-	return checkpoint
+	# PyTorch 2.6+ / TorchScript: jit.load não aceita lambda em map_location; usar torch.device.
+	return safe_torch_load(checkpoint_path, map_location=torch.device(device))
 
 def load_model(path):
-	model = Wav2Lip()
 	print("Load checkpoint from: {}".format(path))
 	checkpoint = _load(path)
-	s = checkpoint["state_dict"]
-	new_s = {}
-	for k, v in s.items():
-		new_s[k.replace('module.', '')] = v
-	model.load_state_dict(new_s)
+	if isinstance(checkpoint, dict):
+		model = Wav2Lip()
+		s = checkpoint.get("state_dict", checkpoint)
+		new_s = {k.replace("module.", ""): v for k, v in s.items()}
+		model.load_state_dict(new_s)
+	elif isinstance(checkpoint, torch.nn.Module):
+		model = checkpoint
+	else:
+		raise TypeError(
+			f"Checkpoint não suportado (esperado dict ou nn.Module): {type(checkpoint)!r}"
+		)
 
-	model = model.to(device)
+	model = model.to(torch.device(device))
 	return model.eval()
 
 model = load_model(args.checkpoint_path)

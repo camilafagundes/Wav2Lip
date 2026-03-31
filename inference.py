@@ -1,12 +1,73 @@
 from os import listdir, path
+import logging
 import numpy as np
 import scipy, cv2, os, sys, argparse, audio
+from pathlib import Path
+
+# PyTorch >= 2.6: checkpoints Wav2Lip exigem weights_only=False (centralizado em utils.torch_compat).
+_p = Path(__file__).resolve().parent
+while _p != _p.parent:
+	if (_p / "utils" / "torch_compat.py").is_file():
+		sys.path.insert(0, str(_p))
+		break
+	_p = _p.parent
+else:
+	raise ImportError(
+		"Não encontrada a pasta avatar-ai (utils/torch_compat.py). "
+		"Defina PYTHONPATH para essa pasta ou use o pipeline via gerar_video.py."
+	)
+from utils.torch_compat import safe_torch_load
+
+from cv2_unicode import imread as imread_unicode
 import json, subprocess, random, string
 from tqdm import tqdm
+
+logger = logging.getLogger(__name__)
+
+_AVATAR_AI_ROOT = Path(__file__).resolve().parent.parent
+_ffmpeg_exe_cache: str | None = None
+
+
+def _ffmpeg_executable() -> str:
+	"""Caminho absoluto do FFmpeg (imageio-ffmpeg ou PATH); fallback 'ffmpeg'."""
+	global _ffmpeg_exe_cache
+	if _ffmpeg_exe_cache is not None:
+		return _ffmpeg_exe_cache
+	try:
+		root = str(_AVATAR_AI_ROOT)
+		if root not in sys.path:
+			sys.path.insert(0, root)
+		from ffmpeg_util import resolve_ffmpeg_exe
+
+		_ffmpeg_exe_cache = resolve_ffmpeg_exe()
+	except Exception:
+		logger.warning("ffmpeg_util indisponível; a usar 'ffmpeg' do PATH", exc_info=False)
+		_ffmpeg_exe_cache = "ffmpeg"
+	return _ffmpeg_exe_cache
+
+
+def _run_ffmpeg(argv: list[str]) -> None:
+	"""Invoca FFmpeg sem shell=True: cada caminho é argumento separado (evita injeção / quebra com espaços)."""
+	exe = _ffmpeg_executable()
+	cmd = [exe, *argv]
+	proc = subprocess.run(
+		cmd,
+		check=False,
+		shell=False,
+		capture_output=True,
+		text=True,
+		encoding="utf-8",
+		errors="replace",
+	)
+	if proc.returncode != 0:
+		tail = (proc.stderr or proc.stdout or "")[-3000:]
+		logger.error("ffmpeg falhou (código %s): %s", proc.returncode, tail)
+		raise RuntimeError(
+			f"FFmpeg terminou com código {proc.returncode}. Verifique ficheiros de entrada e instalação do FFmpeg."
+		)
 from glob import glob
 import torch, face_detection
 from models import Wav2Lip
-import platform
 
 parser = argparse.ArgumentParser(description='Inference code to lip-sync videos in the wild using Wav2Lip models')
 
@@ -53,7 +114,8 @@ parser.add_argument('--nosmooth', default=False, action='store_true',
 args = parser.parse_args()
 args.img_size = 96
 
-if os.path.isfile(args.face) and args.face.split('.')[1] in ['jpg', 'png', 'jpeg']:
+_face_ext = Path(args.face).suffix.lower()
+if os.path.isfile(args.face) and _face_ext in [".jpg", ".jpeg", ".png"]:
 	args.static = True
 
 def get_smoothened_boxes(boxes, T):
@@ -65,31 +127,77 @@ def get_smoothened_boxes(boxes, T):
 		boxes[i] = np.mean(window, axis=0)
 	return boxes
 
-def face_detect(images):
-	detector = face_detection.FaceAlignment(face_detection.LandmarksType._2D, 
-											flip_input=False, device=device)
 
-	batch_size = args.face_det_batch_size
-	
+def _fallback_static_face_box(image):
+	"""Último recurso quando S3FD não vê rosto (cartoons, rosto pequeno): região central-superior típica de retrato."""
+	h, w = image.shape[:2]
+	cx, cy = w // 2, int(h * 0.36)
+	side = int(min(w, h) * 0.72)
+	x1 = max(0, cx - side // 2)
+	x2 = min(w, cx + side // 2)
+	y1 = max(0, cy - int(side * 0.45))
+	y2 = min(h, cy + int(side * 0.55))
+	return (x1, y1, x2, y2)
+
+
+def _run_face_detections(detector, imgs, batch_size):
+	bs = batch_size
 	while 1:
 		predictions = []
 		try:
-			for i in tqdm(range(0, len(images), batch_size)):
-				predictions.extend(detector.get_detections_for_batch(np.array(images[i:i + batch_size])))
+			for i in tqdm(range(0, len(imgs), bs)):
+				predictions.extend(detector.get_detections_for_batch(np.array(imgs[i:i + bs])))
+			return predictions, bs
 		except RuntimeError:
-			if batch_size == 1: 
+			if bs == 1:
 				raise RuntimeError('Image too big to run face detection on GPU. Please use the --resize_factor argument')
-			batch_size //= 2
-			print('Recovering from OOM error; New batch size: {}'.format(batch_size))
-			continue
-		break
+			bs //= 2
+			print('Recovering from OOM error; New batch size: {}'.format(bs))
+
+
+def face_detect(images):
+	detector = face_detection.FaceAlignment(face_detection.LandmarksType._2D,
+											flip_input=False, device=device)
+
+	batch_size = args.face_det_batch_size
+	predictions, batch_size = _run_face_detections(detector, images, batch_size)
+
+	missing = [i for i, p in enumerate(predictions) if p is None]
+	for scale in (2.0, 3.0):
+		if not missing:
+			break
+		sub = [cv2.resize(images[i], None, fx=scale, fy=scale, interpolation=cv2.INTER_LINEAR) for i in missing]
+		sub_pred, batch_size = _run_face_detections(detector, sub, min(batch_size, max(1, len(sub))))
+		inv = 1.0 / scale
+		still = []
+		for idx, pred in zip(missing, sub_pred):
+			if pred is not None:
+				x1, y1, x2, y2 = pred
+				predictions[idx] = (int(x1 * inv), int(y1 * inv), int(x2 * inv), int(y2 * inv))
+			else:
+				still.append(idx)
+		missing = still
+
+	if missing and args.static:
+		print(
+			'[Wav2Lip] Detector não encontrou rosto; usando recorte central (comum em desenhos). '
+			'Para melhor resultado use foto real, rosto grande e de frente.',
+			file=sys.stderr,
+		)
+		for i in missing:
+			predictions[i] = _fallback_static_face_box(images[i])
+		missing = []
 
 	results = []
 	pady1, pady2, padx1, padx2 = args.pads
 	for rect, image in zip(predictions, images):
 		if rect is None:
-			cv2.imwrite('temp/faulty_frame.jpg', image) # check this frame where the face was not detected.
-			raise ValueError('Face not detected! Ensure the video contains a face in all the frames.')
+			os.makedirs('temp', exist_ok=True)
+			cv2.imwrite('temp/faulty_frame.jpg', image)
+			raise ValueError(
+				'Face not detected! Use vídeo com rosto visível em todos os quadros ou foto com rosto humano de frente. '
+				'Ilustrações: tente PNG com o rosto grande e centrado.'
+			)
 
 		y1 = max(0, rect[1] - pady1)
 		y2 = min(image.shape[0], rect[3] + pady2)
@@ -158,32 +266,40 @@ device = 'cuda' if torch.cuda.is_available() else 'cpu'
 print('Using {} for inference.'.format(device))
 
 def _load(checkpoint_path):
-	if device == 'cuda':
-		checkpoint = torch.load(checkpoint_path)
-	else:
-		checkpoint = torch.load(checkpoint_path,
-								map_location=lambda storage, loc: storage)
-	return checkpoint
+	# TorchScript vs dict: safe_torch_load escolhe jit.load ou torch.load (PyTorch 2.6+).
+	return safe_torch_load(checkpoint_path, map_location=torch.device(device))
 
 def load_model(path):
-	model = Wav2Lip()
 	print("Load checkpoint from: {}".format(path))
 	checkpoint = _load(path)
-	s = checkpoint["state_dict"]
-	new_s = {}
-	for k, v in s.items():
-		new_s[k.replace('module.', '')] = v
-	model.load_state_dict(new_s)
 
-	model = model.to(device)
+	# PyTorch 2.11+: torch.load pode devolver ScriptModule sem passar em isinstance(..., ScriptModule).
+	# Só tratar como checkpoint em pickle se for dict (incl. OrderedDict com state_dict ou pesos crus).
+	if isinstance(checkpoint, dict):
+		model = Wav2Lip()
+		s = checkpoint.get("state_dict", checkpoint)
+		new_s = {k.replace("module.", ""): v for k, v in s.items()}
+		model.load_state_dict(new_s)
+	elif isinstance(checkpoint, torch.nn.Module):
+		model = checkpoint
+	else:
+		raise TypeError(
+			f"Checkpoint não suportado (esperado dict ou nn.Module): {type(checkpoint)!r}"
+		)
+
+	model = model.to(torch.device(device))
 	return model.eval()
 
 def main():
 	if not os.path.isfile(args.face):
 		raise ValueError('--face argument must be a valid path to video/image file')
 
-	elif args.face.split('.')[1] in ['jpg', 'png', 'jpeg']:
-		full_frames = [cv2.imread(args.face)]
+	face_ext = Path(args.face).suffix.lower()
+	if face_ext in [".jpg", ".jpeg", ".png"]:
+		frame0 = imread_unicode(args.face)
+		if frame0 is None:
+			raise ValueError('Não foi possível ler a imagem (--face). Verifique o caminho (acentos/caminho Windows).')
+		full_frames = [frame0]
 		fps = args.fps
 
 	else:
@@ -202,7 +318,7 @@ def main():
 				frame = cv2.resize(frame, (frame.shape[1]//args.resize_factor, frame.shape[0]//args.resize_factor))
 
 			if args.rotate:
-				frame = cv2.rotate(frame, cv2.cv2.ROTATE_90_CLOCKWISE)
+				frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
 
 			y1, y2, x1, x2 = args.crop
 			if x2 == -1: x2 = frame.shape[1]
@@ -214,12 +330,14 @@ def main():
 
 	print ("Number of frames available for inference: "+str(len(full_frames)))
 
+	os.makedirs("temp", exist_ok=True)
+
 	if not args.audio.endswith('.wav'):
 		print('Extracting raw audio...')
-		command = 'ffmpeg -y -i {} -strict -2 {}'.format(args.audio, 'temp/temp.wav')
-
-		subprocess.call(command, shell=True)
-		args.audio = 'temp/temp.wav'
+		audio_src = str(Path(args.audio).expanduser().resolve())
+		temp_wav = str(Path("temp") / "temp.wav")
+		_run_ffmpeg(["-y", "-i", audio_src, "-strict", "-2", temp_wav])
+		args.audio = temp_wav
 
 	wav = audio.load_wav(args.audio, 16000)
 	mel = audio.melspectrogram(wav)
@@ -253,8 +371,12 @@ def main():
 			print ("Model loaded")
 
 			frame_h, frame_w = full_frames[0].shape[:-1]
-			out = cv2.VideoWriter('temp/result.avi', 
-									cv2.VideoWriter_fourcc(*'DIVX'), fps, (frame_w, frame_h))
+			out = cv2.VideoWriter(
+				os.path.join("temp", "result.avi"),
+				cv2.VideoWriter_fourcc(*'DIVX'),
+				fps,
+				(frame_w, frame_h),
+			)
 
 		img_batch = torch.FloatTensor(np.transpose(img_batch, (0, 3, 1, 2))).to(device)
 		mel_batch = torch.FloatTensor(np.transpose(mel_batch, (0, 3, 1, 2))).to(device)
@@ -273,8 +395,24 @@ def main():
 
 	out.release()
 
-	command = 'ffmpeg -y -i {} -i {} -strict -2 -q:v 1 {}'.format(args.audio, 'temp/result.avi', args.outfile)
-	subprocess.call(command, shell=platform.system() != 'Windows')
+	audio_mux = str(Path(args.audio).expanduser().resolve())
+	avi_path = str(Path("temp", "result.avi").resolve())
+	out_path = str(Path(args.outfile).expanduser().resolve())
+	Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+	_run_ffmpeg(
+		[
+			"-y",
+			"-i",
+			audio_mux,
+			"-i",
+			avi_path,
+			"-strict",
+			"-2",
+			"-q:v",
+			"1",
+			out_path,
+		]
+	)
 
 if __name__ == '__main__':
 	main()

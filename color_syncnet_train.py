@@ -1,5 +1,19 @@
 from os.path import dirname, join, basename, isfile
+import sys
+from pathlib import Path
+
 from tqdm import tqdm
+
+# PyTorch >= 2.6: checkpoints com safe_torch_load (weights_only=False para Wav2Lip).
+_p = Path(__file__).resolve().parent
+while _p != _p.parent:
+    if (_p / "utils" / "torch_compat.py").is_file():
+        sys.path.insert(0, str(_p))
+        break
+    _p = _p.parent
+else:
+    raise ImportError("Defina PYTHONPATH para a pasta avatar-ai (utils/torch_compat.py).")
+from utils.torch_compat import safe_torch_load
 
 from models import SyncNet_color as SyncNet
 import audio
@@ -219,12 +233,10 @@ def save_checkpoint(model, optimizer, step, checkpoint_dir, epoch):
     print("Saved checkpoint:", checkpoint_path)
 
 def _load(checkpoint_path):
+    # PyTorch 2.6+ / TorchScript: map_location deve ser torch.device, não lambda.
     if use_cuda:
-        checkpoint = torch.load(checkpoint_path)
-    else:
-        checkpoint = torch.load(checkpoint_path,
-                                map_location=lambda storage, loc: storage)
-    return checkpoint
+        return safe_torch_load(checkpoint_path, map_location=torch.device("cuda"))
+    return safe_torch_load(checkpoint_path, map_location=torch.device("cpu"))
 
 def load_checkpoint(path, model, optimizer, reset_optimizer=False):
     global global_step
@@ -232,7 +244,10 @@ def load_checkpoint(path, model, optimizer, reset_optimizer=False):
 
     print("Load checkpoint from: {}".format(path))
     checkpoint = _load(path)
-    model.load_state_dict(checkpoint["state_dict"])
+    state = checkpoint.get("state_dict", checkpoint) if isinstance(checkpoint, dict) else None
+    if state is None:
+        raise TypeError(f"Checkpoint inválido: {type(checkpoint)!r}")
+    model.load_state_dict(state)
     if not reset_optimizer:
         optimizer_state = checkpoint["optimizer"]
         if optimizer_state is not None:

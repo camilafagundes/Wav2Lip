@@ -2,9 +2,23 @@
 #-*- coding: utf-8 -*-
 # Video 25 FPS, Audio 16000HZ
 
+import sys
+from pathlib import Path
+
 import torch
 import numpy
 import time, pdb, argparse, subprocess, os, math, glob
+
+# PyTorch >= 2.6: pesos SyncNet com safe_torch_load (weights_only=False).
+_p = Path(__file__).resolve().parent
+while _p != _p.parent:
+    if (_p / "utils" / "torch_compat.py").is_file():
+        sys.path.insert(0, str(_p))
+        break
+    _p = _p.parent
+else:
+    raise ImportError("Defina PYTHONPATH para a pasta avatar-ai (utils/torch_compat.py).")
+from utils.torch_compat import safe_torch_load
 import cv2
 import python_speech_features
 
@@ -201,7 +215,8 @@ class SyncNetInstance(torch.nn.Module):
 
 
     def loadParameters(self, path):
-        loaded_state = torch.load(path, map_location=lambda storage, loc: storage);
+        # PyTorch 2.6+ / TorchScript: map_location deve ser torch.device, não lambda.
+        loaded_state = safe_torch_load(path, map_location=torch.device("cpu"))
 
         self_state = self.__S__.state_dict();
 

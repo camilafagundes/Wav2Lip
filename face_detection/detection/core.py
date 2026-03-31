@@ -120,7 +120,12 @@ class FaceDetector(object):
             tensor_or_path {numpy.ndarray, torch.tensor or string} -- path to the image, or the image itself
         """
         if isinstance(tensor_or_path, str):
-            return cv2.imread(tensor_or_path) if not rgb else cv2.imread(tensor_or_path)[..., ::-1]
+            from cv2_unicode import imread as _imread_u
+
+            img = _imread_u(tensor_or_path)
+            if img is None:
+                raise ValueError(f"Não foi possível ler a imagem: {tensor_or_path}")
+            return img if not rgb else img[..., ::-1]
         elif torch.is_tensor(tensor_or_path):
             # Call cpu in case its coming from cuda
             return tensor_or_path.cpu().numpy()[..., ::-1].copy() if not rgb else tensor_or_path.cpu().numpy()
